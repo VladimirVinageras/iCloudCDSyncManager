@@ -1,39 +1,42 @@
-// The Swift Programming Language
-// https://docs.swift.org/swift-book
-//
+//     CoreDataSyncManager
 //  Created by Vladimir Vinakheras on 24.10.2024.
 //
+
+
 import CoreData
 import Foundation
 import Network
 import UserNotifications
 
-/// A manager for synchronizing CoreData with iCloud.
-/// It supports automatic and manual sync modes, handles errors, provides offline support,
-/// resolves conflicts, allows data deletion, and offers notifications and status reports.
+/// A manager to handle CoreData synchronization with iCloud.
+/// It supports both automatic and manual sync modes, manages conflicts,
+/// handles offline scenarios, provides notifications, and offers status reporting.
 @available(macOS 10.15, *)
 public class CoreDataSyncManager: @unchecked Sendable {
     
+    /// The persistent container for CoreData with iCloud support.
     public let persistentContainer: NSPersistentCloudKitContainer
     private var monitor: NWPathMonitor?
+    private var isSaving = false  // Prevents simultaneous saves.
 
-    /// Defines the synchronization mode.
+    /// Defines the available synchronization modes.
     public enum SyncMode {
         case automatic
         case manual
     }
 
-    /// Stores the last synchronization status and time.
+    /// Stores the last sync date and status message.
     public var lastSyncDate: Date?
     public var syncStatus: String = "Not Synced"
-    
+
     // MARK: - Initializer
 
-    /// Initializes the CoreDataSyncManager with the given models and iCloud container.
+    /// Initializes the CoreDataSyncManager with specified model names and iCloud container.
     /// - Parameters:
-    ///   - modelNames: An array of CoreData model names to be synced.
-    ///   - iCloudContainer: The identifier of the iCloud container.
-    ///   - syncMode: The synchronization mode (automatic or manual). Default is automatic.
+    ///   - modelNames: A list of CoreData model names to be synchronized.
+    ///   - iCloudContainer: The identifier for the iCloud container.
+    ///   - syncMode: The synchronization mode, either automatic or manual. Default is automatic.
+    ///   - persistentContainer: Optional existing persistent container.
     public init(
         modelNames: [String],
         iCloudContainer: String,
@@ -47,30 +50,59 @@ public class CoreDataSyncManager: @unchecked Sendable {
                 fatalError("At least one CoreData model name must be provided.")
             }
 
-            self.persistentContainer = NSPersistentCloudKitContainer(name: modelName)
-            guard let firstPerstistentStoreDescription = self.persistentContainer.persistentStoreDescriptions.first else { return}
-            let storeDescription = firstPerstistentStoreDescription
-            storeDescription.cloudKitContainerOptions = NSPersistentCloudKitContainerOptions(containerIdentifier: iCloudContainer)
+            let container = NSPersistentCloudKitContainer(name: modelName)
+            self.persistentContainer = container
+
+            guard let storeDescription = container.persistentStoreDescriptions.first else {
+                fatalError("Failed to get persistent store description.")
+            }
+
+            storeDescription.cloudKitContainerOptions = NSPersistentCloudKitContainerOptions(
+                containerIdentifier: iCloudContainer
+            )
 
             if syncMode == .manual {
-                storeDescription.setOption(true as NSNumber, forKey: NSPersistentStoreRemoteChangeNotificationPostOptionKey)
+                storeDescription.setOption(
+                    true as NSNumber,
+                    forKey: NSPersistentStoreRemoteChangeNotificationPostOptionKey
+                )
             }
 
-            self.persistentContainer.loadPersistentStores { _, error in
-                if let error = error {
-                    fatalError("Failed to load persistent stores: \(error)")
-                }
-            }
+            storeDescription.setOption(
+                true as NSNumber,
+                forKey: NSPersistentHistoryTrackingKey
+            )
+
+            // Desempaquetar correctamente para evitar errores
+            container.viewContext.mergePolicy = NSMergePolicy.mergeByPropertyObjectTrump
+
+            loadPersistentStores()
         }
 
         setupNetworkMonitor()
         setupNotifications()
     }
 
+    /// Loads the persistent stores and handles potential errors.
+    private func loadPersistentStores() {
+        persistentContainer.loadPersistentStores { description, error in
+            if let error = error {
+                print("Persistent store loading error: \(error.localizedDescription)")
+                self.updateSyncStatus(success: false)
+            } else {
+                print("Loaded persistent store: \(description)")
+                self.updateSyncStatus(success: true)
+            }
+        }
+    }
+
     // MARK: - Core Data Saving Support
 
-    /// Saves changes in the managed object context, handling errors if any occur.
+    /// Saves changes in the CoreData context, avoiding simultaneous saves.
     public func saveContext() {
+        guard !isSaving else { return }
+        isSaving = true
+
         let context = persistentContainer.viewContext
         if context.hasChanges {
             do {
@@ -81,9 +113,11 @@ public class CoreDataSyncManager: @unchecked Sendable {
                 updateSyncStatus(success: false)
             }
         }
+
+        isSaving = false
     }
 
-    // MARK: - Manual iCloud Data Deletion
+    // MARK: - iCloud Data Deletion
 
     /// Deletes all data stored in the iCloud container.
     public func deleteDataFromICloud() {
@@ -91,21 +125,25 @@ public class CoreDataSyncManager: @unchecked Sendable {
         let coordinator = persistentContainer.persistentStoreCoordinator
 
         do {
-            try coordinator.destroyPersistentStore(at: storeDescription.url!, ofType: NSSQLiteStoreType, options: nil)
+            try coordinator.destroyPersistentStore(
+                at: storeDescription.url!,
+                ofType: NSSQLiteStoreType,
+                options: nil
+            )
             print("iCloud data deleted successfully.")
         } catch {
             print("Error deleting iCloud data: \(error)")
         }
     }
 
-    // MARK: - Automatic Data Deletion Configuration
+    // MARK: - First Launch Handling
 
-    /// Configures the system to delete iCloud data on app reinstallation.
+    /// Configures the app to delete iCloud data on reinstallation.
     public func configureForAutomaticDeletion() {
         UserDefaults.standard.set(false, forKey: "hasLaunchedBefore")
     }
 
-    /// Handles the first app launch to ensure iCloud data deletion if required.
+    /// Handles the first app launch to ensure iCloud data is deleted if needed.
     public func handleFirstLaunch() {
         let isFirstLaunch = !UserDefaults.standard.bool(forKey: "hasLaunchedBefore")
         if isFirstLaunch {
@@ -117,7 +155,7 @@ public class CoreDataSyncManager: @unchecked Sendable {
     // MARK: - Offline Support
 
     /// Sets up a network monitor to detect connectivity changes and sync data when online.
-    func setupNetworkMonitor() {
+    private func setupNetworkMonitor() {
         monitor = NWPathMonitor()
         monitor?.pathUpdateHandler = { [weak self] path in
             guard let self = self else { return }
@@ -125,6 +163,8 @@ public class CoreDataSyncManager: @unchecked Sendable {
             if path.status == .satisfied {
                 print("Connected. Syncing data...")
                 self.saveContext()
+            } else {
+                print("No internet connection.")
             }
         }
         monitor?.start(queue: DispatchQueue.global(qos: .background))
@@ -132,8 +172,8 @@ public class CoreDataSyncManager: @unchecked Sendable {
 
     // MARK: - Conflict Resolution
 
-    /// Resolves conflicts by choosing between local or iCloud data.
-    /// - Parameter preferLocal: Whether to prefer local data in case of conflict.
+    /// Resolves conflicts by either saving local changes or discarding them.
+    /// - Parameter preferLocal: If true, saves local changes; otherwise, discards them.
     public func resolveConflict(preferLocal: Bool) {
         if preferLocal {
             saveContext()
@@ -145,7 +185,7 @@ public class CoreDataSyncManager: @unchecked Sendable {
     // MARK: - Sync Status Reporting
 
     /// Updates the synchronization status and records the last sync date.
-    /// - Parameter success: Whether the sync was successful.
+    /// - Parameter success: Whether the sync operation was successful.
     private func updateSyncStatus(success: Bool) {
         lastSyncDate = Date()
         syncStatus = success ? "Synced Successfully" : "Sync Failed"
@@ -162,7 +202,7 @@ public class CoreDataSyncManager: @unchecked Sendable {
         }
     }
 
-    /// Sends a local notification with the given message.
+    /// Sends a local notification with the provided message.
     /// - Parameter message: The message to display in the notification.
     public func notifyUser(_ message: String) {
         let content = UNMutableNotificationContent()
